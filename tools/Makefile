@@ -6,19 +6,19 @@ BROTLI = ..
 ENCOBJ = $(BROTLI)/enc/*.o
 DECOBJ = $(BROTLI)/dec/*.o
 
-EXECUTABLES=bro brot
+EXECUTABLES=bro brzip
 
 EXE_OBJS=$(patsubst %, %.o, $(EXECUTABLES))
 
 all : $(EXECUTABLES) links
 
-tests: links brot
+tests: links brzip
 	./brot-test.sh
 
 # Create hard-links for brot (similar to bzcat bunbzip2)
-links: brot
-	ln -f brot brotcat
-	ln -f brot unbrot
+links: brzip
+	ln -f brzip brcat
+	ln -f brzip brunzip
 
 $(EXECUTABLES) : $(EXE_OBJS) deps
 	$(CXX) $(LDFLAGS) $(ENCOBJ) $(DECOBJ) $@.o -o $@

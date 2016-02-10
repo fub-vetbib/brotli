@@ -43,21 +43,21 @@
 #define BUGREPORT "x@y.com"
 
 /* File extensions for brotli files */
-#define EXTENSION ".bro"
-#define EXTLEN    (strlen(EXTENSION))
+#define EXTENSION ".br"
+#define EXTLEN    (sizeof(EXTENSION) - 1)
 
 /* Program name meaning decompression (as with 'bunzip2') */
-#define DECOMP_PROGNAME "unbrot"
+#define DECOMP_PROGNAME "brunzip"
 
 /* Program name meaning decompression to STDOUT (as with 'bzcat') */
-#define CAT_PROGNAME "brotcat"
+#define CAT_PROGNAME "brcat"
 
 enum _opmode {
   COMPRESS,
   DECOMPRESS
 } opmode = COMPRESS;
 
-static int compression_quality = 5; /* 1=fast, 9=best */
+static int compression_quality = -1; /* 1=fast, 11=best */
 static int force;
 static int quiet;
 static int to_stdout;
@@ -120,17 +120,17 @@ void show_usage(const char* progname)
   printf("\
 usage %s [flags] [input files...]\n\
 \n\
-  -c, --stdout      compress to stdout\n\
-  -d, --decompress  decompress\n\
-  -f, --force       force overwrite of output files, writing to terminal\n\
-  -k, --keep        keep original input files\n\
-  -L, --license     show license\n\
-  -q, --quiet       be quiet\n\
-  -v, --verbose     be verbose\n\
-  -V, --version     show version information\n\
-  -t, --test        test input archive\n\
-  -1, --fast        fastest compression\n\
-  -9, --best        best compression\n\
+  -c,  --stdout      compress to stdout\n\
+  -d,  --decompress  decompress\n\
+  -f,  --force       force overwrite of output files, writing to terminal\n\
+  -k,  --keep        keep original input files\n\
+  -L,  --license     show license\n\
+  -q,  --quiet       be quiet\n\
+  -v,  --verbose     be verbose\n\
+  -V,  --version     show version information\n\
+  -t,  --test        test input archive\n\
+  -1,  --fast        fastest compression\n\
+  -11, --best        best compression (default)\n\
 \n\
 If no FILE or when FILE is -, read standard input.\n\
 \n\
@@ -153,7 +153,7 @@ void parse_command_line(int argc, char** argv)
 
   int ch;
   static struct option longopts[] = {
-    {"best",      no_argument,   NULL,    '9'},
+    {"best",      no_argument,   NULL,    'b'},
     {"decompress",no_argument,   NULL,    'd'},
     {"fast",      no_argument,   NULL,    '1'},
     {"force",     no_argument,   NULL,    'f'},
@@ -176,10 +176,16 @@ void parse_command_line(int argc, char** argv)
     opmode = DECOMPRESS;
   }
 
+  int last_was_compression_quality = 0;
   while ((ch = getopt_long(argc, argv,
-                           "123456789cdfhkLqtvV", longopts, NULL)) != -1)
+                           "0123456789cdfhkLqtvV", longopts, NULL)) != -1) {
     switch (ch) {
+      case '0':
       case '1':
+        if (last_was_compression_quality && (compression_quality == 1)) {
+          compression_quality = 10 + (ch - '0');
+          break;
+        }
       case '2':
       case '3':
       case '4':
@@ -188,8 +194,18 @@ void parse_command_line(int argc, char** argv)
       case '7':
       case '8':
       case '9':
-        /* TODO: adapt quality to Brotli scale */
-        compression_quality = (ch - '9');
+        if (compression_quality != -1) {
+          errx(1,"Invalid/repeated compression quality supplied.");
+        }
+        compression_quality = (ch - '0');
+        last_was_compression_quality = 2;
+        break;
+
+      case 'b':
+        if (compression_quality != -1) {
+          errx(1,"Repeated compression quality supplied.");
+        }
+        compression_quality = 11;
         break;
 
       case 'c':
@@ -236,6 +252,13 @@ void parse_command_line(int argc, char** argv)
       default:
         exit_emit_try_help();
     }
+    if (last_was_compression_quality) {
+      --last_was_compression_quality;
+    }
+  }
+  if ((opmode == COMPRESS) && (compression_quality < 0)) {
+    compression_quality = 11;
+  }
   argc -= optind;
   argv += optind;
 
@@ -327,6 +350,57 @@ FILE* open_output_file(const char* infile, const char* outfile)
   return f;
 }
 
+static const size_t kFileBufferSize = 65536;
+
+static void Decompresss(FILE* fin, FILE* fout) {
+  uint8_t* input = new uint8_t[kFileBufferSize];
+  uint8_t* output = new uint8_t[kFileBufferSize];
+  size_t total_out;
+  size_t available_in;
+  const uint8_t* next_in;
+  size_t available_out = kFileBufferSize;
+  uint8_t* next_out = output;
+  BrotliResult result = BROTLI_RESULT_NEEDS_MORE_INPUT;
+  BrotliState s;
+  BrotliStateInit(&s);
+  while (1) {
+    if (result == BROTLI_RESULT_NEEDS_MORE_INPUT) {
+      if (feof(fin)) {
+        break;
+      }
+      available_in = fread(input, 1, kFileBufferSize, fin);
+      next_in = input;
+      if (ferror(fin)) {
+        break;
+      }
+    } else if (result == BROTLI_RESULT_NEEDS_MORE_OUTPUT) {
+      fwrite(output, 1, kFileBufferSize, fout);
+      if (ferror(fout)) {
+        break;
+      }
+      available_out = kFileBufferSize;
+      next_out = output;
+    } else {
+      break; /* Error or success. */
+    }
+    result = BrotliDecompressStream(&available_in, &next_in,
+        &available_out, &next_out, &total_out, &s);
+  }
+  if (next_out != output) {
+    fwrite(output, 1, next_out - output, fout);
+  }
+  BrotliStateCleanup(&s);
+  delete[] input;
+  delete[] output;
+  if ((result == BROTLI_RESULT_NEEDS_MORE_OUTPUT) || ferror(fout)) {
+    fprintf(stderr, "failed to write output\n");
+    exit(1);
+  } else if (result != BROTLI_RESULT_SUCCESS) { /* Error or needs more input. */
+    fprintf(stderr, "corrupt input\n");
+    exit(1);
+  }
+}
+
 void process_file(const char* infile)
 {
   char *outfile = get_output_filename(infile);
@@ -335,9 +409,9 @@ void process_file(const char* infile)
   FILE *fout= open_output_file(infile, outfile);
 
   if (verbose>0)
-    printf("%s '%s' to '%s'\n",
+    fprintf(stderr, "%s '%s' to '%s' (compression_quality=%d)\n",
          (opmode==COMPRESS)?"compressing":"decompressing",
-         infile, outfile);
+         infile, outfile, compression_quality);
 
   if (opmode==COMPRESS) {
     /* Compression */
@@ -352,10 +426,7 @@ void process_file(const char* infile)
     }
   } else {
     /* Decompression */
-    BrotliInput in = BrotliFileInput(fin);
-    BrotliOutput out = BrotliFileOutput(fout);
-    if (!BrotliDecompress(in, out))
-      errx(1,"decompression of '%s' failed (corrupted input?)", infile);
+    Decompresss(fin, fout);
   }
 
   if (fclose(fin))
